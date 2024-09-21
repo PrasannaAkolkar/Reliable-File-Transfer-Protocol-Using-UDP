@@ -20,7 +20,8 @@
 #include "clientUtils.h"
 
 using namespace std;
-using namespace Constants; 
+using namespace Constants;
+
 
 int sockUDP; 
 struct sockaddr_in serverAddr; 
@@ -28,11 +29,20 @@ socklen_t addr_len;
 
 std::vector<char> fileBuffer;  
 std::vector<char> retransmitInfo; 
-bool endFlag = false;
+std::atomic<bool> endFlag = false;
 fileInfo thisFileInfo;
 packet thisPacket;
 packet retransmitPacket;
 
+const int NUM_THREADS1 = 4
+
+// Struct for passing data to retransmission threads
+struct RetransmitThreadData {
+    int startIndex;  // Start index in retransmitInfo
+    int endIndex;    // End index in retransmitInfo
+};
+
+// Struct for passing data to file transmission threads
 
 void *sendFilePart(void *threadarg) {
     struct ThreadData *data = (struct ThreadData *) threadarg;
@@ -129,7 +139,6 @@ void sendFile() {
         usleep(DELAY);
     }
     
-    
 }
 
 void receiveLostPacketIDsMainThread() {
@@ -146,37 +155,59 @@ void receiveLostPacketIDsMainThread() {
         
         std::copy(thisPacket.packetData, thisPacket.packetData + PACKET_SIZE, retransmitInfo.begin());
     }
+
+    // Start multiple threads to retransmit lost packets
+    int numLostPackets = retransmitInfo.size() / 4;  
+    int packetsPerThread = numLostPackets / NUM_THREADS1;
+
+    pthread_t threads[NUM_THREADS1];
+    RetransmitThreadData threadData[NUM_THREADS1];
+
+    for (int t = 0; t < NUM_THREADS1; t++) {
+        threadData[t].startIndex = t * packetsPerThread * 4;  // Multiply by 4 to get byte index
+        threadData[t].endIndex = (t == NUM_THREADS1 - 1) ? retransmitInfo.size() : (t + 1) * packetsPerThread * 4;
+
+        int rc = pthread_create(&threads[t], NULL, resendLostPacketsUsingOtherThread, (void *)&threadData[t]);
+        if (rc) {
+            std::cerr << "Error: Unable to create retransmission thread " << rc << std::endl;
+            exit(-1);
+        }
+    }
+
+    // Join the retransmission threads after they finish
+    for (int t = 0; t < NUM_THREADS1; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    std::cout << "Finished retransmitting lost packets with multiple threads" << std::endl;
 }
 
 void *resendLostPacketsUsingOtherThread(void *data) {
-    bool endRetransmit = false;
+    RetransmitThreadData *threadData = (RetransmitThreadData *) data;
     int retransmitID;
 
-    while (!endRetransmit) {
-        for (int i = 0; i < PACKET_SIZE; i += 4) {  
-            memcpy(&retransmitID, retransmitInfo.data() + i, 4);
-            if ((retransmitID > 0) && (retransmitID <= thisFileInfo.packetNum)) {
-                memset(&retransmitPacket, 0, sizeof(retransmitPacket));
-                std::copy(fileBuffer.begin() + (retransmitID - 1) * PACKET_SIZE, fileBuffer.begin() + retransmitID * PACKET_SIZE, retransmitPacket.packetData);
-                retransmitPacket.packetID = retransmitID;
+    for (int i = threadData->startIndex; i < threadData->endIndex; i += 4) {  // Iterate over 4-byte packet IDs
+        memcpy(&retransmitID, retransmitInfo.data() + i, 4);
+        if ((retransmitID > 0) && (retransmitID <= thisFileInfo.packetNum)) {
+            memset(&retransmitPacket, 0, sizeof(retransmitPacket));
+            std::copy(fileBuffer.begin() + (retransmitID - 1) * PACKET_SIZE,
+                      fileBuffer.begin() + retransmitID * PACKET_SIZE,
+                      retransmitPacket.packetData);
+            retransmitPacket.packetID = retransmitID;
 
-                if (sendto(sockUDP, &retransmitPacket, sizeof(retransmitPacket), 0, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) == -1) {
-                    //error("Failed to send lost packet");
-                    exit(1);
-                }
-
-                usleep(DELAY);
+            if (sendto(sockUDP, &retransmitPacket, sizeof(retransmitPacket), 0, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) == -1) {
+                std::cerr << "Error: Failed to retransmit lost packet" << std::endl;
+                pthread_exit(NULL);  // Exit on error
             }
-        }
 
-        endRetransmit = endFlag;
+            usleep(DELAY);
+        }
     }
+    
     pthread_exit(NULL);
 }
 
-
 int main(int argc, char *argv[]) {
-    
     // Start timer using chrono
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -191,10 +222,7 @@ int main(int argc, char *argv[]) {
     cout << "Resend lost packets" << endl;
 
     retransmitInfo.resize(PACKET_SIZE, 0);
-    pthread_t thread_id;
-    pthread_create(&thread_id, NULL, resendLostPacketsUsingOtherThread, NULL);
     receiveLostPacketIDsMainThread();
-    usleep(100);
 
     close(sockUDP);
 
@@ -206,10 +234,8 @@ int main(int argc, char *argv[]) {
     double throughput = fileSizeMb / elapsed.count();  // Throughput in Mbits/s
 
     cout << "File Send to the server" << endl;
-    //cout << "Transfer file size = " << fileSizeMb << " Mbits" << endl;
     cout << "Transmission Time = " << elapsed.count() << " sec" << endl;
     cout << "Throughput = " << throughput << " Mbits/s" << endl;
 
     return 0;
 }
-
